@@ -1,67 +1,253 @@
 name: Update M3U Playlist
 
+# ============================================================
+# ТРИГГЕРЫ ЗАПУСКА
+# ============================================================
 on:
-  # Автоматический запуск каждые 6 часов
+  # Автоматический запуск каждые 6 часов (UTC)
   schedule:
     - cron: '0 */6 * * *'
   
-  # Ручной запуск через UI GitHub
+  # Ручной запуск через кнопку в UI GitHub
   workflow_dispatch:
+  
+  # Запуск при пуше в ветку main (для тестов)
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '*.m3u'
+      - 'vezon_cache.json'
+      - 'README.md'
+
+# ============================================================
+# ПРАВА ДОСТУПА (решает ошибку exit code 128)
+# ============================================================
+permissions:
+  contents: write   # Разрешаем писать обратно в репозиторий
+  actions: read
 
 jobs:
   update-playlist:
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # Защита от зависания
+    
+    env:
+      # Подавляем warning про Node 20 (согласно GitHub Blog, Node 24 
+      # станет дефолтом с 16 июня 2026, warning исчезнет сам)
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      PYTHONUNBUFFERED: 1
     
     steps:
-    # Шаг 1: Получаем код из репозитория
-    - name: Checkout repository
+    # ============================================================
+    # ШАГ 1: Получаем код репозитория
+    # ============================================================
+    - name: 📥 Checkout repository
       uses: actions/checkout@v4
       with:
+        # Сохраняем credentials для последующего git push
+        persist-credentials: true
         token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 1  # Достаточно последнего коммита
     
-    # Шаг 2: Устанавливаем Python
-    - name: Set up Python
+    # ============================================================
+    # ШАГ 2: Устанавливаем Python
+    # ============================================================
+    - name: 🐍 Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
         cache: 'pip'
     
-    # Шаг 3: Устанавливаем зависимости
-    - name: Install dependencies
+    # ============================================================
+    # ШАГ 3: Устанавливаем зависимости
+    # ============================================================
+    - name: 📦 Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        else
+          # Fallback: устанавливаем вручную
+          pip install requests beautifulsoup4 urllib3
+        fi
+        echo "✅ Зависимости установлены"
+        pip list | grep -E "requests|beautifulsoup4|urllib3"
     
-    # Шаг 4: Запускаем скрипт генерации
-    - name: Generate playlist
+    # ============================================================
+    # ШАГ 4: Запускаем скрипт генерации плейлиста
+    # ============================================================
+    - name: 🎬 Generate M3U playlist
+      id: generate
       run: |
-        python script.py --per-category 20 --no-vlc --output vezon_playlist.m3u
-      env:
-        # Если нужны секреты, добавьте их здесь
-        PYTHONUNBUFFERED: 1
+        echo "=== Запуск генерации: $(date -u +'%Y-%m-%d %H:%M:%S UTC') ==="
+        
+        # Создаём папку для диагностики
+        mkdir -p debug_logs
+        
+        # Запускаем скрипт и сохраняем вывод в лог-файл
+        python script.py \
+          --per-category 5 \
+          --no-vlc \
+          --output vezon_playlist.m3u \
+          2>&1 | tee debug_logs/script_output.log
+        
+        echo "=== Генерация завершена ==="
+        ls -lah *.m3u *.json 2>/dev/null || true
+      continue-on-error: true  # Продолжаем даже при ошибке скрипта
     
-    # Шаг 5: Коммитим изменения обратно в репозиторий
-    - name: Commit and push changes
+    # ============================================================
+    # ШАГ 5: Диагностика (на случай, если сайт блокирует GitHub IP)
+    # Сохраняем артефакты для анализа
+    # ============================================================
+    - name: 🔍 Prepare debug artifacts
+      if: always()
       run: |
-        # Настраиваем git для коммита
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
+        echo "=== Проверка результатов ==="
         
-        # Добавляем плейлист и кеш
-        git add vezon_playlist.m3u || true
-        git add vezon_cache.json || true
+        # Информация о созданном плейлисте
+        if [ -f vezon_playlist.m3u ]; then
+          TOTAL_LINES=$(wc -l < vezon_playlist.m3u)
+          VIDEO_COUNT=$(grep -c "^#EXTINF" vezon_playlist.m3u || echo 0)
+          echo "📊 Статистика плейлиста:"
+          echo "  - Всего строк: $TOTAL_LINES"
+          echo "  - Видео (EXTINF): $VIDEO_COUNT"
+          
+          # Первые и последние строки для проверки
+          echo "--- Первые 10 строк ---"
+          head -n 10 vezon_playlist.m3u
+          echo "--- Последние 10 строк ---"
+          tail -n 10 vezon_playlist.m3u
+        else
+          echo "❌ Файл плейлиста НЕ создан!"
+          echo "empty" > debug_logs/playlist_missing.txt
+        fi
         
-        # Проверяем, есть ли изменения
-        if git diff --cached --quiet; then
-          echo "Изменений нет, пропуск коммита"
+        # Проверка размера файла
+        if [ -f vezon_playlist.m3u ]; then
+          FILE_SIZE=$(stat -c%s "vezon_playlist.m3u" 2>/dev/null || stat -f%z "vezon_playlist.m3u")
+          echo "📏 Размер файла: $FILE_SIZE байт"
+          
+          # Если файл подозрительно маленький — сохраняем тревожный флаг
+          if [ "$FILE_SIZE" -lt 500 ]; then
+            echo "⚠ ВНИМАНИЕ: Файл слишком маленький! Возможно, сайт блокирует GitHub IP."
+            echo "blocked" > debug_logs/suspicious_size.txt
+          fi
+        fi
+    
+    - name: 📤 Upload debug artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: debug-artifacts-${{ github.run_number }}
+        path: |
+          vezon_playlist.m3u
+          vezon_cache.json
+          debug_logs/
+        retention-days: 7
+        if-no-files-found: ignore
+    
+    # ============================================================
+    # ШАГ 6: Проверяем, имеет ли смысл коммитить
+    # (не коммитим пустые или подозрительно маленькие файлы)
+    # ============================================================
+    - name: ✅ Validate playlist
+      id: validate
+      run: |
+        if [ ! -f vezon_playlist.m3u ]; then
+          echo "❌ Плейлист не создан, коммит пропускается"
+          echo "should_commit=false" >> $GITHUB_OUTPUT
           exit 0
         fi
         
-        # Коммитим с датой
-        git commit -m "🔄 Auto-update playlist [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+        FILE_SIZE=$(stat -c%s "vezon_playlist.m3u" 2>/dev/null || stat -f%z "vezon_playlist.m3u")
+        VIDEO_COUNT=$(grep -c "^#EXTINF" vezon_playlist.m3u || echo 0)
         
-        # Пушим обратно
-        git push
-      env:
-        # Токен для push (автоматически предоставляется GitHub)
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Минимальные пороги (настройте под свои нужды)
+        MIN_SIZE=500      # минимум 500 байт
+        MIN_VIDEOS=5      # минимум 5 видео
+        
+        if [ "$FILE_SIZE" -lt "$MIN_SIZE" ] || [ "$VIDEO_COUNT" -lt "$MIN_VIDEOS" ]; then
+          echo "⚠ Плейлист выглядит неполным:"
+          echo "  Размер: $FILE_SIZE байт (минимум $MIN_SIZE)"
+          echo "  Видео: $VIDEO_COUNT (минимум $MIN_VIDEOS)"
+          echo "  Возможная причина: сайт блокирует IP GitHub"
+          echo "should_commit=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        echo "✅ Плейлист валиден: $VIDEO_COUNT видео, $FILE_SIZE байт"
+        echo "should_commit=true" >> $GITHUB_OUTPUT
+    
+    # ============================================================
+    # ШАГ 7: Коммит и пуш изменений обратно в репозиторий
+    # ============================================================
+    - name: 💾 Commit and push changes
+      if: steps.validate.outputs.should_commit == 'true'
+      run: |
+        # Настраиваем git
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # Добавляем только нужные файлы
+        git add vezon_playlist.m3u 2>/dev/null || true
+        git add vezon_cache.json 2>/dev/null || true
+        
+        # Проверяем, есть ли реальные изменения
+        if git diff --cached --quiet; then
+          echo "ℹ️  Изменений нет, пропуск коммита"
+          exit 0
+        fi
+        
+        # Показываем статистику изменений
+        echo "📋 Изменённые файлы:"
+        git diff --cached --stat
+        
+        # Создаём коммит
+        TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M UTC')
+        VIDEO_COUNT=$(grep -c "^#EXTINF" vezon_playlist.m3u 2>/dev/null || echo "?")
+        
+        git commit -m "🔄 Auto-update playlist [$TIMESTAMP] — $VIDEO_COUNT videos"
+        
+        # Пушим (с retry на случай временных ошибок)
+        MAX_RETRIES=3
+        RETRY_COUNT=0
+        
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          if git push origin main; then
+            echo "✅ Изменения успешно запушены в GitHub"
+            exit 0
+          fi
+          
+          RETRY_COUNT=$((RETRY_COUNT + 1))
+          echo "⚠ Попытка $RETRY_COUNT из $MAX_RETRIES не удалась, повтор через 10 сек..."
+          sleep 10
+        done
+        
+        echo "❌ Не удалось запушить после $MAX_RETRIES попыток"
+        exit 1
+    
+    # ============================================================
+    # ШАГ 8: Финальная сводка
+    # ============================================================
+    - name: 📊 Final summary
+      if: always()
+      run: |
+        echo "============================================"
+        echo "🏁 ИТОГОВАЯ СВОДКА"
+        echo "============================================"
+        echo "📅 Время: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+        echo "🔢 Run ID: ${{ github.run_id }}"
+        echo "🌿 Ветка: ${{ github.ref_name }}"
+        
+        if [ -f vezon_playlist.m3u ]; then
+          VIDEO_COUNT=$(grep -c "^#EXTINF" vezon_playlist.m3u || echo 0)
+          FILE_SIZE=$(stat -c%s "vezon_playlist.m3u" 2>/dev/null || stat -f%z "vezon_playlist.m3u")
+          echo "📺 Видео в плейлисте: $VIDEO_COUNT"
+          echo "📏 Размер файла: $FILE_SIZE байт"
+          echo "🔗 Raw ссылка:"
+          echo "   https://raw.githubusercontent.com/${{ github.repository }}/main/vezon_playlist.m3u"
+        else
+          echo "❌ Плейлист НЕ создан"
+        fi
+        
+        echo "============================================"
