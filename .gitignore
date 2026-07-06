@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Временные файлы
+*.log
+*.tmp
+
+# Кеш (опционально - можно коммитить для скорости)
+# vezon_cache.json
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+

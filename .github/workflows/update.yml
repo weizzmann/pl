@@ -1,0 +1,67 @@
+name: Update M3U Playlist
+
+on:
+  # Автоматический запуск каждые 6 часов
+  schedule:
+    - cron: '0 */6 * * *'
+  
+  # Ручной запуск через UI GitHub
+  workflow_dispatch:
+
+jobs:
+  update-playlist:
+    runs-on: ubuntu-latest
+    
+    steps:
+    # Шаг 1: Получаем код из репозитория
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    # Шаг 2: Устанавливаем Python
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    # Шаг 3: Устанавливаем зависимости
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    # Шаг 4: Запускаем скрипт генерации
+    - name: Generate playlist
+      run: |
+        python script.py --per-category 20 --no-vlc --output vezon_playlist.m3u
+      env:
+        # Если нужны секреты, добавьте их здесь
+        PYTHONUNBUFFERED: 1
+    
+    # Шаг 5: Коммитим изменения обратно в репозиторий
+    - name: Commit and push changes
+      run: |
+        # Настраиваем git для коммита
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # Добавляем плейлист и кеш
+        git add vezon_playlist.m3u || true
+        git add vezon_cache.json || true
+        
+        # Проверяем, есть ли изменения
+        if git diff --cached --quiet; then
+          echo "Изменений нет, пропуск коммита"
+          exit 0
+        fi
+        
+        # Коммитим с датой
+        git commit -m "🔄 Auto-update playlist [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+        
+        # Пушим обратно
+        git push
+      env:
+        # Токен для push (автоматически предоставляется GitHub)
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
